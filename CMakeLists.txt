@@ -42,6 +42,7 @@ configure_file(
 
 add_executable(crow 
     src/main.cpp
+    db/database.cpp
 )
 
 target_link_libraries(crow PRIVATE 

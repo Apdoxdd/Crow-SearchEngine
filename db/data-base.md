@@ -59,3 +59,13 @@
         | id (PK)       |
         | term          |
         +---------------+
+
+
+        <BS>             SQLite Database File
+                       |
+             ┌─────────┼─────────┐
+             |         |         |
+          Crawler   Indexer   QueryEngine
+          Manager   Manager    Manager
+             |         |         |
+          Conn 1    Conn 2    Conn 3
