@@ -1,0 +1,51 @@
+cmake_minimum_required(VERSION 3.20)
+project(crow LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+# libcurl
+set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(CURL_USE_OPENSSL ON CACHE BOOL "" FORCE)
+add_subdirectory(third-party/curl EXCLUDE_FROM_ALL)
+
+# libxml2
+set(LIBXML2_WITH_PYTHON OFF CACHE BOOL "" FORCE)
+set(LIBXML2_WITH_ICONV OFF CACHE BOOL "" FORCE)
+set(LIBXML2_WITH_LZMA OFF CACHE BOOL "" FORCE)
+set(LIBXML2_WITH_ZLIB OFF CACHE BOOL "" FORCE)
+set(LIBXML2_WITH_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBXML2_WITH_PROGRAMS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third-party/libxml2 EXCLUDE_FROM_ALL)
+
+# sqlitecpp
+set(SQLITECPP_RUN_CPPLINT OFF CACHE BOOL "" FORCE)
+set(SQLITECPP_RUN_CPPCHECK OFF CACHE BOOL "" FORCE)
+set(SQLITECPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SQLITECPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(third-party/sqlite-cpp EXCLUDE_FROM_ALL)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/db/schema.sql 
+    ${CMAKE_BINARY_DIR}/db/schema.sql 
+    COPYONLY 
+)
+
+
+add_executable(crow 
+    src/main.cpp
+)
+
+target_link_libraries(crow PRIVATE 
+    CURL::libcurl 
+    LibXml2::LibXml2 
+    SQLiteCpp
+)
