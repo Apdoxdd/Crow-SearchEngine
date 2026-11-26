@@ -43,6 +43,7 @@ configure_file(
 add_executable(crow 
     src/main.cpp
     db/database.cpp
+    src/indexer/HTML_Parser.cpp
 )
 
 target_link_libraries(crow PRIVATE 
