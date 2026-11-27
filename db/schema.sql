@@ -16,4 +16,25 @@ CREATE TABLE IF NOT EXISTS frontier (
 
 	);
 
+CREATE TABLE IF NOT EXISTS page_links(
+	source_id INTEGER NOT NULL,
+	target_id INTEGER NOT NULL,
+
+	PRIMARY KEY(source_id, target_id),
+
+	FOREIGN KEY (source_id) REFERENCES frontier(id) ON DELETE CASCADE,
+	FOREIGN KEY (target_id) REFERENCES frontier(id) ON DELETE CASCADE 
+	) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_page_links_target
+ON page_links(target_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_frontier_contenthash
+ON frontier(contentHash);
+
+CREATE INDEX IF NOT EXISTS idx_frontier_queue
+ON frontier(frequency DESC) WHERE isCrawled = 0;
+
+
+
 
