@@ -13,6 +13,169 @@ const std::filesystem::path TEST_DB_PATH {"tests/db/temp/crawler_tests.db"};
 const std::filesystem::path SCHEMA_PATH {"db/schema.sql"};
 
 ///////////////////////DATABASE HELPERS/////////////////////////////
+///
+const std::filesystem::path CTOR_DB_PATH {"tests/db/temp/constructor_tests.db"};
+
+struct page_row
+{
+    bool exists = false;
+    int id = -1;
+    int frequency = -1;
+    int isCrawled = -1;
+    int isIndexed = -1;
+    bool htmlIsNull = true;
+    bool hashIsNull = true;
+    std::string html;
+    std::string contentHash;
+};
+
+// Reads a BLOB column byte-for-byte (keeps embedded NULs).
+std::string blobToString(const SQLite::Column& column)
+{
+    if (column.isNull())
+        return {};
+
+    const void* data = column.getBlob();
+
+    if (!data)
+        return {};
+
+    return std::string(
+        static_cast<const char*>(data),
+        static_cast<std::size_t>(column.getBytes())
+    );
+}
+
+page_row getRow(const std::string& url)
+{
+    SQLite::Database inspect(TEST_DB_PATH.string(), SQLite::OPEN_READONLY);
+
+    SQLite::Statement query(
+        inspect,
+        "SELECT id, frequency, isCrawled, isIndexed, html, contentHash "
+        "FROM frontier WHERE url = ?;"
+    );
+
+    query.bind(1, url);
+
+    page_row row;
+
+    if (!query.executeStep())
+        return row;
+
+    row.exists = true;
+    row.id = query.getColumn(0).getInt();
+    row.frequency = query.getColumn(1).getInt();
+    row.isCrawled = query.getColumn(2).getInt();
+    row.isIndexed = query.getColumn(3).getInt();
+    row.htmlIsNull = query.getColumn(4).isNull();
+    row.hashIsNull = query.getColumn(5).isNull();
+    row.html = blobToString(query.getColumn(4));
+    row.contentHash = blobToString(query.getColumn(5));
+
+    return row;
+}
+
+int getTotalLinkCount()
+{
+    SQLite::Database inspect(TEST_DB_PATH.string(), SQLite::OPEN_READONLY);
+    SQLite::Statement query(inspect, "SELECT COUNT(*) FROM page_links;");
+    query.executeStep();
+    return query.getColumn(0).getInt();
+}
+
+int getIncomingLinkCount(const std::string& url)
+{
+    SQLite::Database inspect(TEST_DB_PATH.string(), SQLite::OPEN_READONLY);
+
+    SQLite::Statement query(
+        inspect,
+        "SELECT COUNT(*) FROM page_links "
+        "WHERE target_id = (SELECT id FROM frontier WHERE url = ?);"
+    );
+
+    query.bind(1, url);
+    query.executeStep();
+    return query.getColumn(0).getInt();
+}
+
+bool edgeExists(const std::string& source, const std::string& target)
+{
+    SQLite::Database inspect(TEST_DB_PATH.string(), SQLite::OPEN_READONLY);
+
+    SQLite::Statement query(
+        inspect,
+        "SELECT 1 FROM page_links "
+        "WHERE source_id = (SELECT id FROM frontier WHERE url = ?1) "
+        "AND target_id = (SELECT id FROM frontier WHERE url = ?2);"
+    );
+
+    query.bind(1, source);
+    query.bind(2, target);
+    return query.executeStep();
+}
+
+// Same as urlExists() but for any database file.
+bool urlExistsAt(const std::filesystem::path& dbPath, const std::string& url)
+{
+    SQLite::Database inspect(dbPath.string(), SQLite::OPEN_READONLY);
+    SQLite::Statement query(inspect, "SELECT 1 FROM frontier WHERE url = ?;");
+    query.bind(1, url);
+    return query.executeStep();
+}
+
+// Simulates the indexer.
+void setIndexed(const std::string& url, int value)
+{
+    SQLite::Database writer(TEST_DB_PATH.string(), SQLite::OPEN_READWRITE);
+    SQLite::Statement update(writer, "UPDATE frontier SET isIndexed = ? WHERE url = ?;");
+    update.bind(1, value);
+    update.bind(2, url);
+    update.exec();
+}
+
+void deleteFrontierRow(const std::string& url)
+{
+    SQLite::Database writer(TEST_DB_PATH.string(), SQLite::OPEN_READWRITE);
+    writer.exec("PRAGMA foreign_keys = ON;");
+    SQLite::Statement remove(writer, "DELETE FROM frontier WHERE url = ?;");
+    remove.bind(1, url);
+    remove.exec();
+}
+
+void removeDbFiles(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
+// Installs a trigger for its lifetime, then drops it.
+// Used to force a REAL SQLite error in the middle of saveCrawledPages().
+class scoped_trigger
+{
+public:
+    scoped_trigger(const std::string& name, const std::string& createSql)
+        : _name(name),
+          _db(TEST_DB_PATH.string(), SQLite::OPEN_READWRITE)
+    {
+        _db.exec(createSql);
+    }
+
+    ~scoped_trigger()
+    {
+        try { _db.exec("DROP TRIGGER IF EXISTS " + _name + ";"); }
+        catch (...) {}
+    }
+
+    scoped_trigger(const scoped_trigger&) = delete;
+    scoped_trigger& operator=(const scoped_trigger&) = delete;
+
+private:
+    std::string _name;
+    SQLite::Database _db;
+};
 
 // Returns the database ID of a URL, or -1 if it doesn't exist.
 int getPageId(const std::string& url)
@@ -833,10 +996,17 @@ tests.push_back({
 
         const bool page1Exists = urlExists(page1.url);
         const bool page2Exists = urlExists(page2.url);
+        const int countAfter = getFrontierCount();
+
+	 std::cout << "    page1Exists=" << page1Exists
+                  << " page2Exists=" << page2Exists << '\n'
+                  << "    countBefore=" << countBefore
+                  << " countAfter=" << countAfter << '\n';
 
         return
-            getFrontierCount() == countBefore + 1 &&
-            (page1Exists != page2Exists);
+            countAfter == countBefore + 1 &&
+            page1Exists &&
+            !page2Exists;
     }
 });
 
@@ -975,6 +1145,782 @@ tests.push_back({
             urlExists(pages.back().url);
     }
 });
+
+// A URL discovered through links (placeholder) is later crawled: it must keep
+// its id, edges and frequency, and gain html, hash and isCrawled = 1.
+tests.push_back({
+    "Placeholder becomes a crawled page",
+    [&]()
+    {
+        const html_url s1 {
+            "https://example.com/lifecycle-source-1",
+            "<html>S1</html>",
+            "lifecycle_source_hash_1"
+        };
+
+        const html_url s2 {
+            "https://example.com/lifecycle-source-2",
+            "<html>S2</html>",
+            "lifecycle_source_hash_2"
+        };
+
+        const std::string target = "https://example.com/lifecycle-target";
+
+        const page_links links1 { s1.url, {target} };
+        const page_links links2 { s2.url, {target} };
+
+        // two pages discover the target -> placeholder with frequency 2
+        if (!db.saveCrawledPages({s1, s2}, {links1, links2}))
+            return false;
+
+        const page_row placeholder = getRow(target);
+
+        if (!placeholder.exists ||
+            placeholder.isCrawled != 0 ||
+            !placeholder.htmlIsNull ||
+            !placeholder.hashIsNull ||
+            placeholder.frequency != 2)
+            return false;
+
+        const html_url crawled {
+            target,
+            "<html>Target content</html>",
+            "lifecycle_target_hash"
+        };
+
+        if (!db.saveCrawledPages({crawled}, {}))
+            return false;
+
+        const page_row after = getRow(target);
+
+        return
+            after.id == placeholder.id &&
+            after.frequency == 2 &&
+            after.isCrawled == 1 &&
+            after.isIndexed == 0 &&
+            !after.htmlIsNull &&
+            after.html == crawled.html &&
+            after.contentHash == crawled.contentHash &&
+            getIncomingLinkCount(target) == 2;
+    }
+});
+
+// A placeholder whose fetched content duplicates another page must be marked
+// crawled AND indexed, keep NULL html/hash, and keep its frequency.
+// (Your existing duplicate test only covers a URL that is NOT in the frontier,
+// where markCrawled updates zero rows.)
+tests.push_back({
+    "Duplicate content on a placeholder",
+    [&]()
+    {
+        const html_url original {
+            "https://example.com/dup-placeholder-original",
+            "<html>Shared body</html>",
+            "dup_placeholder_hash"
+        };
+
+        const html_url source {
+            "https://example.com/dup-placeholder-source",
+            "<html>Source</html>",
+            "dup_placeholder_source_hash"
+        };
+
+        const std::string placeholderUrl = "https://example.com/dup-placeholder-target";
+
+        const page_links links { source.url, {placeholderUrl} };
+
+        if (!db.saveCrawledPages({original, source}, {links}))
+            return false;
+
+        const page_row before = getRow(placeholderUrl);
+
+        if (!before.exists || before.isCrawled != 0)
+            return false;
+
+        const html_url duplicate {
+            placeholderUrl,
+            original.html,
+            original.contentHash
+        };
+
+        if (!db.saveCrawledPages({duplicate}, {}))
+            return false;
+
+        const page_row after = getRow(placeholderUrl);
+        const page_row originalRow = getRow(original.url);
+
+        return
+            after.exists &&
+            after.id == before.id &&
+            after.isCrawled == 1 &&
+            after.isIndexed == 1 &&
+            after.htmlIsNull &&
+            after.hashIsNull &&
+            after.frequency == before.frequency &&
+            originalRow.html == original.html &&
+            originalRow.contentHash == original.contentHash;
+    }
+});
+
+// CURRENT BEHAVIOR, decide if you want it: an existing page re-crawled with
+// content identical to ANOTHER page keeps its old html/hash and is force-marked
+// isIndexed = 1. If it was never indexed, its old content now never will be.
+// Flip the expectations if you change the design.
+tests.push_back({
+    "Existing URL re-saved with another page's content (current behavior)",
+    [&]()
+    {
+        const html_url a {
+            "https://example.com/stale-a",
+            "<html>A</html>",
+            "stale_hash_a"
+        };
+
+        const html_url b {
+            "https://example.com/stale-b",
+            "<html>B</html>",
+            "stale_hash_b"
+        };
+
+        if (!db.saveCrawledPages({a, b}, {}))
+            return false;
+
+        const int countBefore = getFrontierCount();
+
+        const html_url aNowSameAsB { a.url, b.html, b.contentHash };
+
+        if (!db.saveCrawledPages({aNowSameAsB}, {}))
+            return false;
+
+        const page_row rowA = getRow(a.url);
+        const page_row rowB = getRow(b.url);
+
+        return
+            getFrontierCount() == countBefore &&
+            rowA.html == a.html &&
+            rowA.contentHash == a.contentHash &&
+            rowA.isCrawled == 1 &&
+            rowA.isIndexed == 1 &&
+            rowB.html == b.html &&
+            rowB.contentHash == b.contentHash;
+    }
+});
+
+// The UNIQUE index on contentHash must release a hash once the only row using
+// it has been updated to new content.
+tests.push_back({
+    "Hash released by an update can be reused",
+    [&]()
+    {
+        const html_url a {
+            "https://example.com/reuse-a",
+            "<html>A v1</html>",
+            "reuse_hash_old"
+        };
+
+        if (!db.saveCrawledPages({a}, {}))
+            return false;
+
+        const html_url aUpdated {
+            a.url,
+            "<html>A v2</html>",
+            "reuse_hash_new"
+        };
+
+        if (!db.saveCrawledPages({aUpdated}, {}))
+            return false;
+
+        const html_url b {
+            "https://example.com/reuse-b",
+            a.html,
+            a.contentHash
+        };
+
+        if (!db.saveCrawledPages({b}, {}))
+            return false;
+
+        return
+            urlExists(b.url) &&
+            verifyPage(b.url, b.html, b.contentHash) &&
+            verifyPage(aUpdated.url, aUpdated.html, aUpdated.contentHash);
+    }
+});
+
+// Same URL twice in one batch with different content: last one wins, one row.
+tests.push_back({
+    "Same URL twice in one batch",
+    [&]()
+    {
+        const html_url first {
+            "https://example.com/twice",
+            "<html>v1</html>",
+            "twice_hash_1"
+        };
+
+        const html_url second {
+            "https://example.com/twice",
+            "<html>v2</html>",
+            "twice_hash_2"
+        };
+
+        const int countBefore = getFrontierCount();
+
+        if (!db.saveCrawledPages({first, second}, {}))
+            return false;
+
+        return
+            getFrontierCount() == countBefore + 1 &&
+            verifyPage(second.url, second.html, second.contentHash);
+    }
+});
+
+// An empty batch is a successful no-op.
+tests.push_back({
+    "Empty batch",
+    [&]()
+    {
+        const int countBefore = getFrontierCount();
+        const int linksBefore = getTotalLinkCount();
+
+        return
+            db.saveCrawledPages({}, {}) &&
+            getFrontierCount() == countBefore &&
+            getTotalLinkCount() == linksBefore;
+    }
+});
+
+// A and B are saved in the SAME call and A links to B: B still gets +1.
+tests.push_back({
+    "Frequency: link between two pages of one batch",
+    [&]()
+    {
+        const html_url a {
+            "https://example.com/same-batch-a",
+            "<html>A</html>",
+            "same_batch_hash_a"
+        };
+
+        const html_url b {
+            "https://example.com/same-batch-b",
+            "<html>B</html>",
+            "same_batch_hash_b"
+        };
+
+        const page_links links { a.url, {b.url} };
+
+        const int countBefore = getFrontierCount();
+
+        if (!db.saveCrawledPages({a, b}, {links}))
+            return false;
+
+        return
+            getFrontierCount() == countBefore + 2 &&
+            getFrequency(a.url) == 1 &&
+            getFrequency(b.url) == 2 &&
+            edgeExists(a.url, b.url);
+    }
+});
+
+// Two sources link to the same brand-new target in one batch.
+tests.push_back({
+    "Frequency: two sources, one new target, one batch",
+    [&]()
+    {
+        const html_url s1 {
+            "https://example.com/new-target-source-1",
+            "<html>S1</html>",
+            "new_target_hash_1"
+        };
+
+        const html_url s2 {
+            "https://example.com/new-target-source-2",
+            "<html>S2</html>",
+            "new_target_hash_2"
+        };
+
+        const std::string target = "https://example.com/new-target-shared";
+
+        const page_links links1 { s1.url, {target} };
+        const page_links links2 { s2.url, {target} };
+
+        const int countBefore = getFrontierCount();
+
+        if (!db.saveCrawledPages({s1, s2}, {links1, links2}))
+            return false;
+
+        return
+            getFrontierCount() == countBefore + 3 &&
+            getFrequency(target) == 2 &&
+            getIncomingLinkCount(target) == 2;
+    }
+});
+
+// The same target repeated inside ONE link list counts once, for a new target
+// (stays 1) and for an existing one (+1 only).
+tests.push_back({
+    "Frequency: repeated target inside one link list",
+    [&]()
+    {
+        const html_url source {
+            "https://example.com/repeat-source",
+            "<html>Source</html>",
+            "repeat_source_hash"
+        };
+
+        const html_url existing {
+            "https://example.com/repeat-existing",
+            "<html>Existing</html>",
+            "repeat_existing_hash"
+        };
+
+        const std::string fresh = "https://example.com/repeat-new";
+
+        if (!db.saveCrawledPages({source, existing}, {}))
+            return false;
+
+        const int existingBefore = getFrequency(existing.url);
+
+        const page_links links {
+            source.url,
+            {fresh, fresh, existing.url, existing.url}
+        };
+
+        if (!db.saveCrawledPages({}, {links}))
+            return false;
+
+        return
+            getFrequency(fresh) == 1 &&
+            getFrequency(existing.url) == existingBefore + 1 &&
+            getOutgoingLinkCount(source.url) == 2;
+    }
+});
+
+// The same link entry twice in one batch must not double count.
+tests.push_back({
+    "Frequency: same link entry twice in one batch",
+    [&]()
+    {
+        const html_url source {
+            "https://example.com/twice-entry-source",
+            "<html>Source</html>",
+            "twice_entry_source_hash"
+        };
+
+        const html_url target {
+            "https://example.com/twice-entry-target",
+            "<html>Target</html>",
+            "twice_entry_target_hash"
+        };
+
+        if (!db.saveCrawledPages({source, target}, {}))
+            return false;
+
+        const int before = getFrequency(target.url);
+
+        const page_links links { source.url, {target.url} };
+
+        if (!db.saveCrawledPages({}, {links, links}))
+            return false;
+
+        return
+            getFrequency(target.url) == before + 1 &&
+            getOutgoingLinkCount(source.url) == 1;
+    }
+});
+
+// Five pages link to one existing page in a single batch: delta of +5.
+tests.push_back({
+    "Frequency: many sources, one existing target",
+    [&]()
+    {
+        const html_url target {
+            "https://example.com/many-target",
+            "<html>Target</html>",
+            "many_target_hash"
+        };
+
+        if (!db.saveCrawledPages({target}, {}))
+            return false;
+
+        const int before = getFrequency(target.url);
+
+        std::vector<html_url> sources;
+        std::vector<page_links> links;
+
+        for (int i = 0; i < 5; ++i)
+        {
+            sources.push_back({
+                "https://example.com/many-source-" + std::to_string(i),
+                "<html>Source " + std::to_string(i) + "</html>",
+                "many_source_hash_" + std::to_string(i)
+            });
+
+            links.push_back({ sources.back().url, {target.url} });
+        }
+
+        if (!db.saveCrawledPages(sources, links))
+            return false;
+
+        return
+            getFrequency(target.url) == before + 5 &&
+            getIncomingLinkCount(target.url) == 5;
+    }
+});
+
+// Frequency keeps growing correctly over several separate batches.
+tests.push_back({
+    "Frequency: accumulates across batches",
+    [&]()
+    {
+        const std::string target = "https://example.com/accumulate-target";
+
+        std::vector<html_url> sources;
+
+        for (int i = 0; i < 3; ++i)
+        {
+            sources.push_back({
+                "https://example.com/accumulate-source-" + std::to_string(i),
+                "<html>Source " + std::to_string(i) + "</html>",
+                "accumulate_source_hash_" + std::to_string(i)
+            });
+        }
+
+        if (!db.saveCrawledPages(sources, {}))
+            return false;
+
+        for (int i = 0; i < 3; ++i)
+        {
+            const page_links links { sources[i].url, {target} };
+
+            if (!db.saveCrawledPages({}, {links}))
+                return false;
+
+            // new placeholder starts at 1, each further referrer adds 1
+            if (getFrequency(target) != i + 1)
+                return false;
+        }
+
+        return getIncomingLinkCount(target) == 3;
+    }
+});
+
+tests.push_back({
+    "Links of an invalid page are dropped",
+    [&]()
+    {
+        const html_url invalid {
+            "https://example.com/invalid-links-source",
+            "",
+            "invalid_links_hash"
+        };
+
+        const std::string target = "https://example.com/invalid-links-target";
+
+        const page_links links { invalid.url, {target} };
+
+        const int countBefore = getFrontierCount();
+        const int linksBefore = getTotalLinkCount();
+
+        if (!db.saveCrawledPages({invalid}, {links}))
+            return false;
+
+        return
+            getFrontierCount() == countBefore &&
+            !urlExists(invalid.url) &&
+            !urlExists(target) &&
+            getTotalLinkCount() == linksBefore;
+    }
+});
+
+tests.push_back({
+    "Links of a duplicate-content page are dropped",
+    [&]()
+    {
+        const html_url original {
+            "https://example.com/dup-links-original",
+            "<html>Shared</html>",
+            "dup_links_hash"
+        };
+
+        if (!db.saveCrawledPages({original}, {}))
+            return false;
+
+        const html_url duplicate {
+            "https://example.com/dup-links-duplicate",
+            original.html,
+            original.contentHash
+        };
+
+        const std::string target = "https://example.com/dup-links-target";
+
+        const page_links links { duplicate.url, {target} };
+
+        const int countBefore = getFrontierCount();
+        const int linksBefore = getTotalLinkCount();
+
+        if (!db.saveCrawledPages({duplicate}, {links}))
+            return false;
+
+        return
+            getFrontierCount() == countBefore &&
+            !urlExists(duplicate.url) &&
+            !urlExists(target) &&
+            getTotalLinkCount() == linksBefore;
+    }
+});
+
+// Your existing update test would pass even if isIndexed were never reset,
+// because the flag starts at 0. This one sets it to 1 first.
+tests.push_back({
+    "Re-crawl with changed content clears isIndexed",
+    [&]()
+    {
+        const html_url v1 {
+            "https://example.com/reindex-changed",
+            "<html>v1</html>",
+            "reindex_changed_hash_1"
+        };
+
+        if (!db.saveCrawledPages({v1}, {}))
+            return false;
+
+        setIndexed(v1.url, 1);
+
+        if (getRow(v1.url).isIndexed != 1)
+            return false;
+
+        const html_url v2 {
+            v1.url,
+            "<html>v2</html>",
+            "reindex_changed_hash_2"
+        };
+
+        if (!db.saveCrawledPages({v2}, {}))
+            return false;
+
+        const page_row row = getRow(v2.url);
+
+        return row.isIndexed == 0 && row.html == v2.html;
+    }
+});
+
+// CURRENT BEHAVIOR, decide if you want it: re-saving IDENTICAL content also
+// resets isIndexed to 0, so unchanged pages get re-indexed on every re-crawl.
+tests.push_back({
+    "Re-crawl with identical content (current behavior: re-queued for indexing)",
+    [&]()
+    {
+        const html_url page {
+            "https://example.com/reindex-same",
+            "<html>Unchanged</html>",
+            "reindex_same_hash"
+        };
+
+        if (!db.saveCrawledPages({page}, {}))
+            return false;
+
+        setIndexed(page.url, 1);
+
+        if (!db.saveCrawledPages({page}, {}))
+            return false;
+
+        return getRow(page.url).isIndexed == 0;
+    }
+});
+
+// html and contentHash are BLOB columns: NUL bytes and non-UTF-8 bytes must
+// survive unchanged.
+tests.push_back({
+    "Binary html and hash round trip",
+    [&]()
+    {
+        std::string html = "<html>";
+        html.push_back('\0');
+        html.push_back('\xff');
+        html.push_back('\x01');
+        html += "</html>";
+
+        const std::string hash("\x00\x01\x02\xfe", 4);
+
+        const html_url page {
+            "https://example.com/binary",
+            html,
+            hash
+        };
+
+        if (!db.saveCrawledPages({page}, {}))
+            return false;
+
+        const page_row row = getRow(page.url);
+
+        return
+            row.html.size() == html.size() &&
+            row.html == html &&
+            row.contentHash.size() == hash.size() &&
+            row.contentHash == hash;
+    }
+});
+
+// An error in the middle of a batch must undo the WHOLE batch and the
+// connection must be usable afterwards.
+tests.push_back({
+    "Failed batch rolls back every change",
+    [&]()
+    {
+        const html_url existing {
+            "https://example.com/rollback-existing",
+            "<html>Existing</html>",
+            "rollback_existing_hash"
+        };
+
+        if (!db.saveCrawledPages({existing}, {}))
+            return false;
+
+        const html_url source {
+            "https://example.com/rollback-source",
+            "<html>Source</html>",
+            "rollback_source_hash"
+        };
+
+        const std::string poison = "https://example.com/poison-insert";
+
+        // existing link first, poisoned second: the first edge is already
+        // written when the error happens
+        const page_links links { source.url, {existing.url, poison} };
+
+        const int countBefore = getFrontierCount();
+        const int linksBefore = getTotalLinkCount();
+        const int frequencyBefore = getFrequency(existing.url);
+
+        bool failed = false;
+
+        {
+            const scoped_trigger guard(
+                "test_poison_insert",
+                "CREATE TRIGGER test_poison_insert BEFORE INSERT ON frontier "
+                "WHEN NEW.url LIKE '%poison-insert%' "
+                "BEGIN SELECT RAISE(ABORT, 'poisoned insert'); END;"
+            );
+
+            failed = !db.saveCrawledPages({source}, {links});
+        }
+
+        if (!failed)
+            return false;
+
+        if (urlExists(source.url) || urlExists(poison))
+            return false;
+
+        if (getFrontierCount() != countBefore ||
+            getTotalLinkCount() != linksBefore ||
+            getFrequency(existing.url) != frequencyBefore)
+            return false;
+
+        // the failed transaction must not be left open
+        const html_url after {
+            "https://example.com/rollback-after",
+            "<html>After</html>",
+            "rollback_after_hash"
+        };
+
+        return
+            db.saveCrawledPages({after}, {}) &&
+            verifyPage(after.url, after.html, after.contentHash);
+    }
+});
+
+// An error while applying the frequency deltas (the last step) must also roll
+// back the edges that were already inserted.
+tests.push_back({
+    "Failed frequency update rolls back the batch",
+    [&]()
+    {
+        const html_url source {
+            "https://example.com/freq-rollback-source",
+            "<html>Source</html>",
+            "freq_rollback_source_hash"
+        };
+
+        const html_url good {
+            "https://example.com/freq-rollback-good",
+            "<html>Good</html>",
+            "freq_rollback_good_hash"
+        };
+
+        const html_url poisoned {
+            "https://example.com/poison-freq-target",
+            "<html>Poisoned</html>",
+            "freq_rollback_poisoned_hash"
+        };
+
+        if (!db.saveCrawledPages({source, good, poisoned}, {}))
+            return false;
+
+        const int goodBefore = getFrequency(good.url);
+        const int poisonedBefore = getFrequency(poisoned.url);
+        const int linksBefore = getTotalLinkCount();
+
+        const page_links links { source.url, {good.url, poisoned.url} };
+
+        bool failed = false;
+
+        {
+            const scoped_trigger guard(
+                "test_poison_frequency",
+                "CREATE TRIGGER test_poison_frequency BEFORE UPDATE OF frequency ON frontier "
+                "WHEN NEW.url LIKE '%poison-freq%' "
+                "BEGIN SELECT RAISE(ABORT, 'poisoned update'); END;"
+            );
+
+            failed = !db.saveCrawledPages({}, {links});
+        }
+
+        return
+            failed &&
+            getFrequency(good.url) == goodBefore &&
+            getFrequency(poisoned.url) == poisonedBefore &&
+            getTotalLinkCount() == linksBefore &&
+            getOutgoingLinkCount(source.url) == 0;
+    }
+});
+
+// Your cascade test only deletes the SOURCE of an edge. This deletes the target.
+tests.push_back({
+    "Cascade deletion of a target removes incoming edges",
+    [&]()
+    {
+        const html_url source {
+            "https://example.com/cascade-target-source",
+            "<html>Source</html>",
+            "cascade_target_source_hash"
+        };
+
+        const html_url target {
+            "https://example.com/cascade-target-target",
+            "<html>Target</html>",
+            "cascade_target_target_hash"
+        };
+
+        const page_links links { source.url, {target.url} };
+
+        if (!db.saveCrawledPages({source, target}, {links}))
+            return false;
+
+        if (!edgeExists(source.url, target.url))
+            return false;
+
+        const int linksBefore = getTotalLinkCount();
+
+        deleteFrontierRow(target.url);
+
+        return
+            urlExists(source.url) &&
+            !urlExists(target.url) &&
+            getOutgoingLinkCount(source.url) == 0 &&
+            getTotalLinkCount() == linksBefore - 1;
+    }
+});
+
 
 // Performance test: inserts 50,000 outgoing relationships from one
 // source page to 50,000 distinct target URLs in a single batch.
