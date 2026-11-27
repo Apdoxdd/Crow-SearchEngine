@@ -7,7 +7,6 @@
 #include <climits>
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +70,8 @@ bool database::saveCrawledPages(
 		 * 	if no match exist insert the url
 		 * check if url exists if so update that url hash and content
 		 * if insert or update succeeds rerturn the ID
+		 * returns true if entire batch suceeded or some entires were dropped but everthing
+		 * worked fine
 		 *
 		 */
 		SQLite::Statement savePage(
@@ -92,7 +93,7 @@ bool database::saveCrawledPages(
 		// mark a url that had its content the same as another as crawled so we dont keep on crawling it over and over 
         	SQLite::Statement markCrawled(
             		_db,
-            		"UPDATE frontier SET isCrawled = 1 WHERE url = ?;"
+            		"UPDATE frontier SET isCrawled = 1, isIndexed = 1 WHERE url = ?;"
         	);
 
 		// when inserting a url after it was discovered (not yet crawled) so we only insert urls that are unique`
@@ -183,6 +184,7 @@ bool database::saveCrawledPages(
 		{
 			// bad entry: skip it instead of failing the whole batch
     			if (page.url.empty() ||
+    				page.html.empty() ||
         			page.contentHash.empty() ||
         			page.html.size() > static_cast<std::size_t>(INT_MAX))
     			{
