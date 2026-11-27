@@ -5,6 +5,12 @@
 #include <string>
 #include <vector>
 
+enum class db_mode
+{
+	read_write,   // crawler, indexer
+	read_only     // query engine
+};
+
 struct html_url 
 {
 	std::string url;
@@ -26,8 +32,9 @@ private:
 public:
 	explicit database(
 			const std::string& dbPath = "db/search_engine.db",
-			const std::string& schemaPath = "db/schema.sql"
-	       ); // prevetns implicit construction of a databse obj from a string
+			const std::string& schemaPath = "db/schema.sql",
+			db_mode mode = db_mode::read_write
+		);
 
 	// CRAWLER OPERATIONS 
 	bool saveCrawledPages( 

@@ -14,12 +14,22 @@
 #include <unordered_set>
 #include <algorithm>
 
-database::database(const std::string& dbPath, const std::string& schemaPath)
-    : _db(dbPath, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE)
+
+database::database(const std::string& dbPath, const std::string& schemaPath, db_mode mode)
+    : _db(dbPath,
+          mode == db_mode::read_only
+              ? SQLite::OPEN_READONLY
+              : (SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE))
 {
+	_db.exec("PRAGMA busy_timeout = 30000;");
+
+	// read-only connections stop here: no schema, no WAL switch, no writes
+	if (mode == db_mode::read_only)
+		return;
+
 	_db.exec("PRAGMA foreign_keys = ON;");
 	_db.exec("PRAGMA journal_mode = WAL;");
-	_db.exec("PRAGMA busy_timeout = 5000;");
+	_db.exec("PRAGMA synchronous = NORMAL;");
 
 	std::ifstream schemaFile(schemaPath);
 
@@ -36,7 +46,7 @@ database::database(const std::string& dbPath, const std::string& schemaPath)
 	if (schemaFile.bad())
 	{
 		throw std::runtime_error(
-				"Failed to read databse schema: " + schemaPath 
+				"Failed to read database schema: " + schemaPath 
 				);
 	}
 
@@ -44,9 +54,6 @@ database::database(const std::string& dbPath, const std::string& schemaPath)
 
 	_db.exec(buffer.str());
 	transaction.commit();
-
-
-
 }
 
 bool database::saveCrawledPages(
@@ -56,8 +63,8 @@ bool database::saveCrawledPages(
 {
 	try 
 	{
+		SQLite::Transaction transaction(_db, SQLite::TransactionBehavior::IMMEDIATE);
 		// One transaction for the entire batch
-		SQLite::Transaction transaction(_db);
 
 
 		/* check if hash already exists if so drop row 
@@ -279,6 +286,13 @@ bool database::saveCrawledPages(
 		}
 		transaction.commit();
 		return true;
+	}
+	catch (const SQLite::Exception& e)
+	{
+		std::cerr << "saveCrawledPages SQLite error " << e.getErrorCode()
+		          << " (extended " << e.getExtendedErrorCode() << "): "
+		          << e.what() << '\n';
+		return false;
 	}
 	catch (const std::exception& e)
 	{
