@@ -303,4 +303,74 @@ bool database::saveCrawledPages(
 	}
 }
 
+bool database::getUrlsToCrawl(
+		int limit,
+		std::vector<std::string>& urls
+		)
+{
+	/* returns up to 'limit' urls that were discovered but not crawled yet
+	 * 	most referenced urls come first (highest frequency)
+	 * 	urls with the same frequency come in the order they were discovered
+	 * returns true if the query worked (even if the queue is empty)
+	 * returns false only if a db error happened, urls is empty in that case
+	 * only reads, never changes the db, so it also works on a read_only connection
+	 */
+
+	// start from a clean output so old contents never leak into the result
+	urls.clear();
+
+	// nothing was asked for: a successful, empty answer
+	if (limit <= 0)
+		return true;
+
+	try
+	{
+		// no transaction as it would it would take the writing when i dont need it
+
+		////////////////////////////////// QUERY ////////////////////////////////////
+		// "isCrawled = 0" matches the partial index idx_frontier_queue, and
+		// ORDER BY frequency DESC follows that index's order, so sqlite reads only
+		// the first 'limit' index entries (no table scan, no sorting).
+		// id is the rowid, the hidden last column of every index, so the tiebreak
+		// costs nothing: among equal frequencies the earliest discovered url wins.
+		SQLite::Statement query(
+				_db,
+				"SELECT url FROM frontier "
+				"WHERE isCrawled = 0 "
+				"ORDER BY frequency DESC, id "
+				"LIMIT ?;"
+				);
+
+		query.bind(1, limit);
+
+		////////////////////////////////// READ ROWS ////////////////////////////////////
+
+		// reserve so the vector doesn't regrow as rows come in, but cap it so a
+		// huge 'limit' (e.g. INT_MAX) can't allocate a huge block up front
+		urls.reserve(std::min<std::size_t>(static_cast<std::size_t>(limit), 4096));
+
+		// each row is one url, rows already arrive in the order we want
+		while (query.executeStep())
+			urls.emplace_back(query.getColumn(0).getString());
+
+		return true;
+	}
+	catch (const SQLite::Exception& e)
+	{
+		// partial results must not be handed out as if they were complete
+		urls.clear();
+
+		std::cerr << "getUrlsToCrawl SQLite error " << e.getErrorCode()
+		          << " (extended " << e.getExtendedErrorCode() << "): "
+		          << e.what() << '\n';
+		return false;
+	}
+	catch (const std::exception& e)
+	{
+		urls.clear();
+
+		std::cerr << "getUrlsToCrawl failed: " << e.what() << std::endl;
+		return false;
+	}
+}
 

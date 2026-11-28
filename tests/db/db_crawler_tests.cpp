@@ -8,12 +8,130 @@
 #include <filesystem>
 #include <exception>
 #include <chrono>
+#include <climits>
+#include <thread>
+#include <atomic>
 
 const std::filesystem::path TEST_DB_PATH {"tests/db/temp/crawler_tests.db"};
 const std::filesystem::path SCHEMA_PATH {"db/schema.sql"};
+const std::filesystem::path QUEUE_DB_PATH {"tests/db/temp/queue_tests.db"};
+const std::filesystem::path CONC_DB_PATH {"tests/db/temp/concurrency_tests.db"};
 
-///////////////////////DATABASE HELPERS/////////////////////////////
-///
+///////////////////////DATABASE-TESTS HELPERS/////////////////////////////
+
+// Simulates one indexer pass on its OWN connection: picks up to 100 crawled,
+// not-yet-indexed pages and marks them indexed in one IMMEDIATE transaction.
+// Returns how many pages it marked.
+int indexerPass(SQLite::Database& idx)
+{
+    std::vector<std::int64_t> ids;
+
+    {
+        SQLite::Statement select(
+            idx,
+            "SELECT id FROM frontier WHERE isCrawled = 1 AND isIndexed = 0 LIMIT 100;"
+        );
+
+        while (select.executeStep())
+            ids.push_back(select.getColumn(0).getInt64());
+    }
+
+    if (ids.empty())
+        return 0;
+
+    SQLite::Transaction transaction(idx, SQLite::TransactionBehavior::IMMEDIATE);
+
+    SQLite::Statement update(idx, "UPDATE frontier SET isIndexed = 1 WHERE id = ?;");
+
+    for (const auto id : ids)
+    {
+        update.bind(1, id);
+        update.exec();
+        update.reset();
+    }
+
+    transaction.commit();
+
+    return static_cast<int>(ids.size());
+}
+
+// isIndexed of a url in any database file, or -1 if the url doesn't exist.
+int getIsIndexedAt(const std::filesystem::path& dbPath, const std::string& url)
+{
+    SQLite::Database inspect(dbPath.string(), SQLite::OPEN_READONLY);
+    SQLite::Statement query(inspect, "SELECT isIndexed FROM frontier WHERE url = ?;");
+    query.bind(1, url);
+
+    if (!query.executeStep())
+        return -1;
+
+    return query.getColumn(0).getInt();
+}
+
+// Reads one integer from any database file.
+int scalarAt(const std::filesystem::path& dbPath, const std::string& sql)
+{
+    SQLite::Database inspect(dbPath.string(), SQLite::OPEN_READONLY);
+    SQLite::Statement query(inspect, sql);
+    query.executeStep();
+    return query.getColumn(0).getInt();
+}
+const std::string QUEUE_A = "https://example.com/q-a";   // frequency 1
+const std::string QUEUE_B = "https://example.com/q-b";   // frequency 2
+const std::string QUEUE_C = "https://example.com/q-c";   // frequency 3
+
+void removeDbFiles(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
+// Three crawled pages that reference three never-crawled URLs:
+//   p1 -> A, B, C    p2 -> B, C    p3 -> C     =>  A:1  B:2  C:3
+bool seedQueue(database& q)
+{
+    const html_url p1 { "https://example.com/q-p1", "<html>p1</html>", "queue_hash_1" };
+    const html_url p2 { "https://example.com/q-p2", "<html>p2</html>", "queue_hash_2" };
+    const html_url p3 { "https://example.com/q-p3", "<html>p3</html>", "queue_hash_3" };
+
+    const page_links l1 { p1.url, {QUEUE_A, QUEUE_B, QUEUE_C} };
+    const page_links l2 { p2.url, {QUEUE_B, QUEUE_C} };
+    const page_links l3 { p3.url, {QUEUE_C} };
+
+    return q.saveCrawledPages({p1, p2, p3}, {l1, l2, l3});
+}
+
+// Runs raw SQL on the queue database through a separate connection.
+void execQueueSql(const std::string& sql)
+{
+    SQLite::Database other(QUEUE_DB_PATH.string(), SQLite::OPEN_READWRITE);
+    other.exec(sql);
+}
+
+// Returns the query plan text of the exact query getUrlsToCrawl() runs.
+std::string getQueuePlan()
+{
+    SQLite::Database inspect(QUEUE_DB_PATH.string(), SQLite::OPEN_READONLY);
+
+    // must match the SQL inside getUrlsToCrawl()
+    SQLite::Statement plan(
+        inspect,
+        "EXPLAIN QUERY PLAN "
+        "SELECT url FROM frontier "
+        "WHERE isCrawled = 0 "
+        "ORDER BY frequency DESC, id "
+        "LIMIT 10;"
+    );
+
+    std::string text;
+
+    while (plan.executeStep())
+        text += plan.getColumn(3).getString() + "\n";
+
+    return text;
+}
 const std::filesystem::path CTOR_DB_PATH {"tests/db/temp/constructor_tests.db"};
 
 struct page_row
@@ -143,13 +261,6 @@ void deleteFrontierRow(const std::string& url)
     remove.exec();
 }
 
-void removeDbFiles(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(path.string() + "-wal", ec);
-    std::filesystem::remove(path.string() + "-shm", ec);
-}
 
 // Installs a trigger for its lifetime, then drops it.
 // Used to force a REAL SQLite error in the middle of saveCrawledPages().
@@ -351,6 +462,683 @@ int main()
 
     int passed = 0;
     int failed = 0;
+
+    // The crawler manager saves batches while the indexer marks pages indexed on
+// its own connection at the same time. Nothing may fail or get lost.
+tests.push_back({
+    "Concurrency: crawler batches and indexer writes at the same time",
+    [&]()
+    {
+        removeDbFiles(CONC_DB_PATH);
+        database crawlerDb(CONC_DB_PATH.string(), SCHEMA_PATH.string());
+
+        constexpr int ROUNDS = 40;
+        constexpr int PAGES_PER_ROUND = 50;
+        const std::string hub = "https://example.com/conc-hub";
+
+        std::atomic<bool> crawlerDone { false };
+        std::atomic<int> crawlerFailures { 0 };
+        std::atomic<int> indexerFailures { 0 };
+
+        std::thread crawler([&]()
+        {
+            for (int r = 0; r < ROUNDS; ++r)
+            {
+                std::vector<html_url> pages;
+                std::vector<page_links> links;
+
+                for (int i = 0; i < PAGES_PER_ROUND; ++i)
+                {
+                    const std::string id = std::to_string(r) + "-" + std::to_string(i);
+
+                    pages.push_back({
+                        "https://example.com/conc-page-" + id,
+                        "<html>" + id + "</html>",
+                        "conc_hash_" + id
+                    });
+
+                    // every page links to one shared hub plus a unique target
+                    links.push_back({
+                        pages.back().url,
+                        { hub, "https://example.com/conc-target-" + id }
+                    });
+                }
+
+                if (!crawlerDb.saveCrawledPages(pages, links))
+                    ++crawlerFailures;
+            }
+
+            crawlerDone = true;
+        });
+
+        std::thread indexer([&]()
+        {
+            try
+            {
+                SQLite::Database idx(CONC_DB_PATH.string(), SQLite::OPEN_READWRITE);
+                idx.exec("PRAGMA busy_timeout = 30000;");
+
+                while (true)
+                {
+                    // read the flag BEFORE the pass so one full pass always
+                    // happens after the crawler has finished
+                    const bool done = crawlerDone.load();
+
+                    const int marked = indexerPass(idx);
+
+                    if (marked == 0 && done)
+                        break;
+
+                    if (marked == 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            catch (const std::exception& e)
+            {
+                std::cout << "    indexer error: " << e.what() << '\n';
+                ++indexerFailures;
+            }
+        });
+
+        crawler.join();
+        indexer.join();
+
+        constexpr int TOTAL_PAGES = ROUNDS * PAGES_PER_ROUND;
+
+        // pages + one unique target each + the shared hub
+        const int expectedRows = TOTAL_PAGES * 2 + 1;
+
+        std::cout << "    crawlerFailures=" << crawlerFailures
+                  << " indexerFailures=" << indexerFailures << '\n';
+
+        return
+            crawlerFailures == 0 &&
+            indexerFailures == 0 &&
+            scalarAt(CONC_DB_PATH, "SELECT COUNT(*) FROM frontier;") == expectedRows &&
+            // every page referenced the hub exactly once
+            scalarAt(CONC_DB_PATH,
+                     "SELECT frequency FROM frontier "
+                     "WHERE url = 'https://example.com/conc-hub';") == TOTAL_PAGES &&
+            scalarAt(CONC_DB_PATH, "SELECT COUNT(*) FROM page_links;") == TOTAL_PAGES * 2 &&
+            // the indexer's updates were not lost
+            scalarAt(CONC_DB_PATH,
+                     "SELECT COUNT(*) FROM frontier "
+                     "WHERE isCrawled = 1 AND isIndexed = 0;") == 0;
+    }
+});
+
+// Another connection holds the write lock for ~300 ms. The crawler's batch must
+// WAIT (busy_timeout) and then succeed, not fail immediately.
+tests.push_back({
+    "Concurrency: saveCrawledPages waits for a held write lock",
+    [&]()
+    {
+        removeDbFiles(CONC_DB_PATH);
+        database crawlerDb(CONC_DB_PATH.string(), SCHEMA_PATH.string());
+
+        std::atomic<bool> lockHeld { false };
+
+        std::thread holder([&]()
+        {
+            SQLite::Database other(CONC_DB_PATH.string(), SQLite::OPEN_READWRITE);
+            other.exec("BEGIN IMMEDIATE;");
+            lockHeld = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            other.exec("COMMIT;");
+        });
+
+        while (!lockHeld)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        const html_url page {
+            "https://example.com/conc-waiting-page",
+            "<html>Waiting</html>",
+            "conc_waiting_hash"
+        };
+
+        const auto start = std::chrono::steady_clock::now();
+        const bool saved = crawlerDb.saveCrawledPages({page}, {});
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        holder.join();
+
+        std::cout << "    waited " << elapsed << " ms for the lock\n";
+
+        return
+            saved &&
+            elapsed >= 200 &&
+            scalarAt(CONC_DB_PATH, "SELECT COUNT(*) FROM frontier;") == 1;
+    }
+});
+
+// DOCUMENTS A SQLITE RULE FOR THE INDEXER: a plain BEGIN (deferred) that reads
+// and then writes after the crawler committed fails at once with
+// SQLITE_BUSY_SNAPSHOT (extended code 517). busy_timeout cannot help here.
+// The indexer must start its write transactions with BEGIN IMMEDIATE.
+tests.push_back({
+    "Concurrency: deferred transaction fails after a concurrent commit",
+    [&]()
+    {
+        removeDbFiles(CONC_DB_PATH);
+        database crawlerDb(CONC_DB_PATH.string(), SCHEMA_PATH.string());
+
+        const html_url first { "https://example.com/conc-snap-1", "<html>1</html>", "conc_snap_hash_1" };
+        const html_url second { "https://example.com/conc-snap-2", "<html>2</html>", "conc_snap_hash_2" };
+
+        if (!crawlerDb.saveCrawledPages({first}, {}))
+            return false;
+
+        SQLite::Database indexerDb(CONC_DB_PATH.string(), SQLite::OPEN_READWRITE);
+        indexerDb.exec("PRAGMA busy_timeout = 30000;");
+
+        indexerDb.exec("BEGIN;");   // deferred
+
+        {
+            SQLite::Statement read(indexerDb, "SELECT COUNT(*) FROM frontier;");
+            read.executeStep();     // snapshot is taken here
+        }
+
+        // the crawler commits while the indexer's snapshot is open
+        if (!crawlerDb.saveCrawledPages({second}, {}))
+            return false;
+
+        bool gotSnapshotError = false;
+
+        try
+        {
+            indexerDb.exec("UPDATE frontier SET isIndexed = 1;");
+        }
+        catch (const SQLite::Exception& e)
+        {
+            gotSnapshotError = (e.getExtendedErrorCode() == 517);   // SQLITE_BUSY_SNAPSHOT
+        }
+
+        indexerDb.exec("ROLLBACK;");
+
+        return gotSnapshotError;
+    }
+});
+
+// Stale-index race: the indexer read v1, the crawler re-saved v2, then the
+// indexer reports "done". A plain update wrongly marks v2 as indexed; an update
+// guarded by the content hash the indexer actually read changes nothing.
+tests.push_back({
+    "Concurrency: indexer must guard its update with the content hash it read",
+    [&]()
+    {
+        removeDbFiles(CONC_DB_PATH);
+        database crawlerDb(CONC_DB_PATH.string(), SCHEMA_PATH.string());
+
+        const std::string url = "https://example.com/conc-stale";
+        const std::string v1Hash = "conc_stale_hash_v1";
+
+        const html_url v1 { url, "<html>v1</html>", v1Hash };
+        const html_url v2 { url, "<html>v2</html>", "conc_stale_hash_v2" };
+
+        if (!crawlerDb.saveCrawledPages({v1}, {}))
+            return false;
+
+        // ... indexer reads v1 and starts indexing it ...
+
+        // meanwhile the crawler re-crawls the page: new content, isIndexed = 0
+        if (!crawlerDb.saveCrawledPages({v2}, {}))
+            return false;
+
+        if (getIsIndexedAt(CONC_DB_PATH, url) != 0)
+            return false;
+
+        SQLite::Database indexerDb(CONC_DB_PATH.string(), SQLite::OPEN_READWRITE);
+        indexerDb.exec("PRAGMA busy_timeout = 30000;");
+
+        // guarded update: only if the content is still the v1 the indexer read
+        SQLite::Statement guarded(
+            indexerDb,
+            "UPDATE frontier SET isIndexed = 1 WHERE url = ?1 AND contentHash = ?2;"
+        );
+
+        guarded.bind(1, url);
+        guarded.bind(2, v1Hash.data(), static_cast<int>(v1Hash.size()));   // BLOB, like the column
+
+        const int changed = guarded.exec();
+
+        if (changed != 0 || getIsIndexedAt(CONC_DB_PATH, url) != 0)
+            return false;   // v2 must stay queued for indexing
+
+        // the unguarded update is the bug the guard prevents
+        SQLite::Statement naive(indexerDb, "UPDATE frontier SET isIndexed = 1 WHERE url = ?;");
+        naive.bind(1, url);
+
+        return naive.exec() == 1 && getIsIndexedAt(CONC_DB_PATH, url) == 1;
+    }
+});
+
+    // Most referenced first. The crawled pages p1, p2, p3 are never returned.
+tests.push_back({
+    "getUrlsToCrawl: highest frequency first",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B, QUEUE_A};
+    }
+});
+
+// Only 'limit' URLs come back, and they are the best ones.
+tests.push_back({
+    "getUrlsToCrawl: respects limit",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(2, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B};
+    }
+});
+
+// limit of 1 returns exactly the top URL.
+tests.push_back({
+    "getUrlsToCrawl: limit of one",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(1, urls) &&
+            urls == std::vector<std::string>{QUEUE_C};
+    }
+});
+
+// A limit bigger than the queue returns the whole queue, not an error.
+// INT_MAX also proves the capped reserve() doesn't allocate for the limit.
+tests.push_back({
+    "getUrlsToCrawl: limit larger than the queue",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls;
+
+        if (!q.getUrlsToCrawl(1000, urls) || urls.size() != 3)
+            return false;
+
+        return
+            q.getUrlsToCrawl(INT_MAX, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B, QUEUE_A};
+    }
+});
+
+// Equal frequency: the URL discovered first comes first.
+tests.push_back({
+    "getUrlsToCrawl: ties are broken by discovery order",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        const std::string d = "https://example.com/q-d";
+        const std::string e = "https://example.com/q-e";
+
+        const html_url p4 { "https://example.com/q-p4", "<html>p4</html>", "queue_hash_4" };
+        const page_links l4 { p4.url, {d, e} };
+
+        if (!q.saveCrawledPages({p4}, {l4}))
+            return false;
+
+        std::vector<std::string> urls;
+
+        // A, D, E all have frequency 1 and were discovered in that order
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B, QUEUE_A, d, e};
+    }
+});
+
+// The queue follows frequency changes: when a URL gets referenced more, it
+// moves up on the next call.
+tests.push_back({
+    "getUrlsToCrawl: order follows frequency changes",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        // three more pages link to A: frequency 1 -> 4, now above C (3)
+        std::vector<html_url> pages;
+        std::vector<page_links> links;
+
+        for (int i = 4; i <= 6; ++i)
+        {
+            pages.push_back({
+                "https://example.com/q-p" + std::to_string(i),
+                "<html>p" + std::to_string(i) + "</html>",
+                "queue_hash_" + std::to_string(i)
+            });
+
+            links.push_back({ pages.back().url, {QUEUE_A} });
+        }
+
+        if (!q.saveCrawledPages(pages, links))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_A, QUEUE_C, QUEUE_B};
+    }
+});
+
+// Once a placeholder is crawled it leaves the queue.
+tests.push_back({
+    "getUrlsToCrawl: skips crawled pages",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        const html_url crawledC { QUEUE_C, "<html>c</html>", "queue_hash_c" };
+
+        if (!q.saveCrawledPages({crawledC}, {}))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_B, QUEUE_A};
+    }
+});
+
+// A placeholder found to have duplicate content is marked crawled, so it
+// also leaves the queue instead of being fetched again and again.
+tests.push_back({
+    "getUrlsToCrawl: skips duplicate-content placeholders",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        // fetching C returns the same body as p1
+        const html_url duplicateC { QUEUE_C, "<html>p1</html>", "queue_hash_1" };
+
+        if (!q.saveCrawledPages({duplicateC}, {}))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_B, QUEUE_A};
+    }
+});
+
+// Pages saved directly (seeds) are crawled from the start and must not appear.
+tests.push_back({
+    "getUrlsToCrawl: crawled-only database returns nothing",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        const html_url seed1 { "https://example.com/q-seed1", "<html>1</html>", "queue_seed_1" };
+        const html_url seed2 { "https://example.com/q-seed2", "<html>2</html>", "queue_seed_2" };
+
+        if (!q.saveCrawledPages({seed1, seed2}, {}))
+            return false;
+
+        std::vector<std::string> urls;
+
+        return q.getUrlsToCrawl(10, urls) && urls.empty();
+    }
+});
+
+// Nothing to crawl is a successful, empty answer.
+tests.push_back({
+    "getUrlsToCrawl: empty queue",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        std::vector<std::string> urls;
+
+        return q.getUrlsToCrawl(10, urls) && urls.empty();
+    }
+});
+
+// limit <= 0 returns true and an empty result; stale contents are cleared.
+tests.push_back({
+    "getUrlsToCrawl: zero and negative limit",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls { "stale" };
+
+        if (!q.getUrlsToCrawl(0, urls) || !urls.empty())
+            return false;
+
+        urls = { "stale" };
+
+        return q.getUrlsToCrawl(-5, urls) && urls.empty();
+    }
+});
+
+// The output vector is replaced, not appended to.
+tests.push_back({
+    "getUrlsToCrawl: clears previous contents of the output vector",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> urls { "stale" };
+
+        return
+            q.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B, QUEUE_A};
+    }
+});
+
+// The function only reads: calling it repeatedly gives the same answer
+// (nothing is "handed out" or changed).
+tests.push_back({
+    "getUrlsToCrawl: is read-only and repeatable",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        std::vector<std::string> first;
+        std::vector<std::string> second;
+
+        return
+            q.getUrlsToCrawl(10, first) &&
+            q.getUrlsToCrawl(10, second) &&
+            first == second &&
+            first.size() == 3;
+    }
+});
+
+// The query engine opens the database read-only and must still be able to
+// read the queue while the crawler's connection is open.
+tests.push_back({
+    "getUrlsToCrawl: works on a read-only connection",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database writer(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(writer))
+            return false;
+
+        database reader(
+            QUEUE_DB_PATH.string(),
+            SCHEMA_PATH.string(),
+            db_mode::read_only
+        );
+
+        std::vector<std::string> urls;
+
+        return
+            reader.getUrlsToCrawl(10, urls) &&
+            urls == std::vector<std::string>{QUEUE_C, QUEUE_B, QUEUE_A};
+    }
+});
+
+// A real database error returns false and leaves the output empty, never a
+// stale or partial list. The table is dropped through a second connection.
+tests.push_back({
+    "getUrlsToCrawl: database error returns false and empty output",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        if (!seedQueue(q))
+            return false;
+
+        execQueueSql("DROP TABLE page_links; DROP TABLE frontier;");
+
+        std::vector<std::string> urls { "stale" };
+
+        return !q.getUrlsToCrawl(10, urls) && urls.empty();
+    }
+});
+
+// Guards the optimization: the plan must use the partial index and must not
+// need a temporary sort. If someone edits the query or the index, this fails.
+tests.push_back({
+    "getUrlsToCrawl: query plan uses idx_frontier_queue",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        const std::string plan = getQueuePlan();
+
+        return
+            plan.find("idx_frontier_queue") != std::string::npos &&
+            plan.find("TEMP B-TREE") == std::string::npos;
+    }
+});
+
+// The best 100 of 20,000 placeholders come back in the right order.
+// 50 placeholders are boosted to frequency 2, the other 19,950 stay at 1.
+tests.push_back({
+    "getUrlsToCrawl: top 100 of 20000",
+    [&]()
+    {
+        removeDbFiles(QUEUE_DB_PATH);
+        database q(QUEUE_DB_PATH.string(), SCHEMA_PATH.string());
+
+        constexpr int PLACEHOLDERS = 20'000;
+
+        // one crawled source links to every placeholder (each frequency 1)
+        const html_url source { "https://example.com/q-big-source", "<html>big</html>", "queue_big_hash" };
+
+        page_links bigLinks;
+        bigLinks.url = source.url;
+
+        for (int i = 0; i < PLACEHOLDERS; ++i)
+            bigLinks.links.push_back("https://example.com/q-big-" + std::to_string(i));
+
+        if (!q.saveCrawledPages({source}, {bigLinks}))
+            return false;
+
+        // 50 extra crawled pages link only to the first 50 placeholders
+        std::vector<html_url> boosters;
+        std::vector<page_links> boosterLinks;
+
+        for (int p = 0; p < 50; ++p)
+        {
+            boosters.push_back({
+                "https://example.com/q-booster-" + std::to_string(p),
+                "<html>booster " + std::to_string(p) + "</html>",
+                "queue_booster_hash_" + std::to_string(p)
+            });
+
+            page_links entry;
+            entry.url = boosters.back().url;
+            entry.links.push_back("https://example.com/q-big-" + std::to_string(p));
+            boosterLinks.push_back(entry);
+        }
+
+        if (!q.saveCrawledPages(boosters, boosterLinks))
+            return false;
+
+        std::vector<std::string> urls;
+
+        const auto start = std::chrono::steady_clock::now();
+
+        if (!q.getUrlsToCrawl(100, urls) || urls.size() != 100)
+            return false;
+
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start
+            ).count();
+
+        std::cout << "    Read top 100 of " << PLACEHOLDERS
+                  << " in " << elapsed << " ms\n";
+
+        // 0..49 are boosted (frequency 2), 50..99 are the earliest frequency-1
+        // URLs; both blocks are in discovery order because of the id tiebreak
+        for (int i = 0; i < 100; ++i)
+            if (urls[i] != "https://example.com/q-big-" + std::to_string(i))
+                return false;
+
+        return elapsed < 1000;
+    }
+});
 
     // databse init
     tests.push_back({
