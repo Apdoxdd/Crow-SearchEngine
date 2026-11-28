@@ -1,7 +1,10 @@
+
+#include "HTML_Parser.hpp"
 #include <iostream>
 #include <curl/curl.h>
 #include <libxml/xmlversion.h>
 #include <SQLiteCpp/SQLiteCpp.h>
+#include <libxml/HTMLparser.h>
 
 int main() {
     std::cout << "libcurl:   " << curl_version() << '\n';

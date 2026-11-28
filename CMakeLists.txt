@@ -52,6 +52,10 @@ target_link_libraries(crow PRIVATE
     LibXml2::LibXml2 
     SQLiteCpp
 )
+target_include_directories(crow PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/indexer
+        ${CMAKE_SOURCE_DIR}/db
+    )
 # ============================================================
 # TESTING
 # ============================================================
