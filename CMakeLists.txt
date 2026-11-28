@@ -90,6 +90,27 @@ if(BUILD_TESTS)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
+    add_executable(html_parser_test
+    tests/indexer/main_HTML_Parser_test.cpp
+    src/indexer/HTML_Parser.cpp
+    )
+
+    target_link_libraries(html_parser_test PRIVATE
+    LibXml2::LibXml2    
+    )
+ 
+    target_include_directories(html_parser_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/indexer
+    )
+
+    add_test(
+    NAME html_parser_test
+    COMMAND html_parser_test
+    )
+
+    set_tests_properties(html_parser_test PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    )
 endif()
 
 
